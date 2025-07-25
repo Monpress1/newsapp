@@ -1,153 +1,142 @@
 // server.js
 const WebSocket = require('ws');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+const { Pool } = require('pg'); // Import Pool from pg library
+const path = require('path'); // Still needed if you use path elsewhere, but not for DB_PATH anymore
 
 // WebSocket server setup
-// Use process.env.PORT for Render.com deployment
-const PORT = process.env.PORT || 3000; // Use environment variable or fallback to 3000
+const PORT = process.env.PORT || 3000;
 const wss = new WebSocket.Server({ port: PORT });
 console.log(`WebSocket server started on ws://localhost:${PORT}`);
 
-// Database setup
-// *** CRITICAL: For Render.com, SQLite in-memory or a persistent external DB is needed ***
-// If you want to persist data, you MUST use an external database like PostgreSQL
-// If using SQLite for testing/development, consider an in-memory database for Render
-// For now, let's stick to the file but be aware of the ephemeral filesystem.
-const DB_PATH = path.resolve(__dirname, 'news.db');
-const db = new sqlite3.Database(DB_PATH, (err) => {
-    if (err) {
-        console.error('Error connecting to database:', err.message);
-    } else {
-        console.log('Connected to the SQLite database.');
-        initDb();
+// --- PostgreSQL Database setup ---
+// Use environment variable for database connection string
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: {
+        rejectUnauthorized: false // Required for Render's managed PostgreSQL to connect from Node.js
     }
 });
 
-/**
- * Initializes the database tables if they don't exist.
- */
-function initDb() {
-    db.serialize(() => {
-        db.run(`
+// Connect and initialize database
+async function connectAndInitDb() {
+    let client;
+    try {
+        client = await pool.connect(); // Get a client from the pool
+        console.log('Connected to PostgreSQL database.');
+
+        // 1. Create articles table
+        await client.query(`
             CREATE TABLE IF NOT EXISTS articles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 title TEXT NOT NULL,
                 content TEXT NOT NULL,
                 imageUrl TEXT,
-                timestamp INTEGER NOT NULL
-            )
-        `, (err) => {
-            if (err) console.error('Error creating articles table:', err.message);
-            else console.log('Articles table ensured.');
-            // Add a test article if the table was just created and is empty
-            db.get("SELECT COUNT(*) AS count FROM articles", (countErr, row) => {
-                if (countErr) {
-                    console.error("Error checking article count:", countErr.message);
-                    return;
-                }
-                if (row.count === 0) {
-                    console.log("No articles found, inserting a sample article...");
-                    db.run(
-                        "INSERT INTO articles (title, content, imageUrl, timestamp) VALUES (?, ?, ?, ?)",
-                        ["Welcome to the News Hub!", "This is a sample article to show that the system is working. Add your own news!", "", Date.now()],
-                        function(insertErr) {
-                            if (insertErr) {
-                                console.error("Error inserting sample article:", insertErr.message);
-                            } else {
-                                console.log("Sample article inserted with ID:", this.lastID);
-                                // Broadcast the new article immediately if the server just started and added it
-                                // This assumes clients are already connected, which might not be true right after startup
-                                // Best practice: clients request ALL_ARTICLES on connect.
-                            }
-                        }
-                    );
-                }
-            });
-        });
+                timestamp BIGINT NOT NULL
+            );
+        `);
+        console.log('Articles table ensured.');
 
-        db.run(`
+        // Add a test article if the table is empty
+        const countResult = await client.query("SELECT COUNT(*) AS count FROM articles;");
+        if (parseInt(countResult.rows[0].count) === 0) {
+            console.log("No articles found, inserting a sample article...");
+            await client.query(
+                "INSERT INTO articles (title, content, imageUrl, timestamp) VALUES ($1, $2, $3, $4)",
+                ["Welcome to the News Hub!", "This is a sample article to show that the system is working persistently!", "", Date.now()]
+            );
+            console.log("Sample article inserted with ID.");
+        }
+
+        // 2. Create comments table
+        await client.query(`
             CREATE TABLE IF NOT EXISTS comments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                article_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
                 userName TEXT NOT NULL,
                 commentText TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE
-            )
-        `, (err) => {
-            if (err) console.error('Error creating comments table:', err.message);
-            else console.log('Comments table ensured.');
-        });
+                timestamp BIGINT NOT NULL
+            );
+        `);
+        console.log('Comments table ensured.');
 
-        db.run(`
+        // 3. Create reactions table
+        await client.query(`
             CREATE TABLE IF NOT EXISTS reactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                article_id INTEGER NOT NULL,
+                id SERIAL PRIMARY KEY,
+                article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
                 clientId TEXT NOT NULL,
                 type TEXT NOT NULL, -- 'thumbs_up', 'love', 'sad'
-                timestamp INTEGER NOT NULL,
-                FOREIGN KEY (article_id) REFERENCES articles(id) ON DELETE CASCADE
-            )
-        `, (err) => {
-            if (err) console.error('Error creating reactions table:', err.message);
-            else console.log('Reactions table ensured.');
-        });
-    });
+                timestamp BIGINT NOT NULL
+            );
+        `);
+        console.log('Reactions table ensured.');
+
+    } catch (err) {
+        console.error('Error connecting or initializing PostgreSQL:', err.message);
+        // Exit process if database connection fails at startup, as app won't function
+        process.exit(1);
+    } finally {
+        if (client) {
+            client.release(); // Release the client back to the pool
+        }
+    }
 }
+
+connectAndInitDb(); // Call the async function to connect and initialize on startup
+
+// --- Database interaction functions (using pg.Pool) ---
 
 /**
  * Fetches all articles along with their comments and reactions.
  * @returns {Promise<Array>} A promise that resolves to an array of article objects.
  */
 async function getAllArticles() {
-    return new Promise((resolve, reject) => {
-        db.all("SELECT * FROM articles ORDER BY timestamp DESC", async (err, articles) => {
-            if (err) {
-                console.error("Error in getAllArticles DB query:", err.message); // Added logging
-                return reject(err);
-            }
+    const client = await pool.connect();
+    try {
+        // Fetch all articles
+        const articlesResult = await client.query("SELECT * FROM articles ORDER BY timestamp DESC;");
+        const articles = articlesResult.rows;
 
-            if (!articles || articles.length === 0) {
-                console.log("No articles found in the database."); // Added logging
-                return resolve([]); // Resolve with empty array if no articles
-            }
+        if (!articles || articles.length === 0) {
+            console.log("No articles found in the database (PostgreSQL).");
+            return [];
+        }
 
-            const articlesWithDetails = [];
-            for (const article of articles) {
-                const comments = await new Promise((res, rej) => {
-                    db.all("SELECT userName, commentText, timestamp FROM comments WHERE article_id = ? ORDER BY timestamp ASC", [article.id], (err, rows) => {
-                        if (err) {
-                            console.error(`Error fetching comments for article ${article.id}:`, err.message); // Added logging
-                            rej(err);
-                        }
-                        else res(rows);
-                    });
-                });
+        const articlesWithDetails = [];
+        for (const article of articles) {
+            // Fetch comments for each article
+            const commentsResult = await client.query(
+                "SELECT userName, commentText, timestamp FROM comments WHERE article_id = $1 ORDER BY timestamp ASC;",
+                [article.id]
+            );
+            const comments = commentsResult.rows;
 
-                const reactions = await new Promise((res, rej) => {
-                    db.all("SELECT clientId, type, timestamp FROM reactions WHERE article_id = ?", [article.id], (err, rows) => {
-                        if (err) {
-                            console.error(`Error fetching reactions for article ${article.id}:`, err.message); // Added logging
-                            rej(err);
-                        }
-                        else res(rows);
-                    });
-                });
+            // Fetch reactions for each article
+            const reactionsResult = await client.query(
+                "SELECT clientId, type, timestamp FROM reactions WHERE article_id = $1;",
+                [article.id]
+            );
+            const reactions = reactionsResult.rows;
 
-                articlesWithDetails.push({
-                    id: article.id,
-                    title: article.title,
-                    content: article.content,
-                    imageUrl: article.imageUrl,
-                    timestamp: article.timestamp,
-                    comments: comments,
-                    reactions: reactions
-                });
-            }
-            resolve(articlesWithDetails);
-        });
-    });
+            articlesWithDetails.push({
+                id: article.id,
+                title: article.title,
+                content: article.content,
+                imageUrl: article.imageUrl,
+                timestamp: article.timestamp,
+                comments: comments,
+                reactions: reactions
+            });
+        }
+        return articlesWithDetails;
+    } catch (err) {
+        console.error("Error in getAllArticles (PostgreSQL):", err.message);
+        throw err; // Re-throw to be caught by the calling WebSocket handler
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
 }
 
 /**
@@ -156,20 +145,23 @@ async function getAllArticles() {
  * @returns {Promise<object>} A promise that resolves to the inserted article with its ID.
  */
 async function addArticle(article) {
-    return new Promise((resolve, reject) => {
-        db.run(
-            "INSERT INTO articles (title, content, imageUrl, timestamp) VALUES (?, ?, ?, ?)",
-            [article.title, article.content, article.imageUrl, article.timestamp],
-            function(err) { // Use function() for 'this' context
-                if (err) {
-                    console.error("Error inserting article:", err.message); // Added logging
-                    return reject(err);
-                }
-                console.log(`Article "${article.title}" inserted with ID: ${this.lastID}`); // Added logging
-                resolve({ id: this.lastID, ...article });
-            }
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            "INSERT INTO articles (title, content, imageUrl, timestamp) VALUES ($1, $2, $3, $4) RETURNING id;",
+            [article.title, article.content, article.imageUrl, article.timestamp]
         );
-    });
+        const newId = result.rows[0].id;
+        console.log(`Article "${article.title}" inserted with ID: ${newId}`);
+        return { id: newId, ...article };
+    } catch (err) {
+        console.error("Error inserting article (PostgreSQL):", err.message);
+        throw err;
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
 }
 
 /**
@@ -179,20 +171,23 @@ async function addArticle(article) {
  * @returns {Promise<object>} A promise that resolves to the inserted comment.
  */
 async function addComment(articleId, comment) {
-    return new Promise((resolve, reject) => {
-        db.run(
-            "INSERT INTO comments (article_id, userName, commentText, timestamp) VALUES (?, ?, ?, ?)",
-            [articleId, comment.userName, comment.commentText, comment.timestamp],
-            function(err) {
-                if (err) {
-                    console.error("Error inserting comment:", err.message); // Added logging
-                    return reject(err);
-                }
-                console.log(`Comment added for article ${articleId} by ${comment.userName}`); // Added logging
-                resolve({ id: this.lastID, ...comment });
-            }
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            "INSERT INTO comments (article_id, userName, commentText, timestamp) VALUES ($1, $2, $3, $4) RETURNING id;",
+            [articleId, comment.userName, comment.commentText, comment.timestamp]
         );
-    });
+        const newId = result.rows[0].id;
+        console.log(`Comment added for article ${articleId} by ${comment.userName}`);
+        return { id: newId, ...comment };
+    } catch (err) {
+        console.error("Error inserting comment (PostgreSQL):", err.message);
+        throw err;
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
 }
 
 /**
@@ -202,22 +197,24 @@ async function addComment(articleId, comment) {
  * @returns {Promise<object>} A promise that resolves to the inserted reaction.
  */
 async function addReaction(articleId, reaction) {
-    return new Promise((resolve, reject) => {
-        db.run(
-            "INSERT INTO reactions (article_id, clientId, type, timestamp) VALUES (?, ?, ?, ?)",
-            [articleId, reaction.clientId, reaction.type, reaction.timestamp],
-            function(err) {
-                if (err) {
-                    console.error("Error inserting reaction:", err.message); // Added logging
-                    return reject(err);
-                }
-                console.log(`Reaction '${reaction.type}' added for article ${articleId} by client ${reaction.clientId}`); // Added logging
-                resolve({ id: this.lastID, ...reaction });
-            }
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            "INSERT INTO reactions (article_id, clientId, type, timestamp) VALUES ($1, $2, $3, $4) RETURNING id;",
+            [articleId, reaction.clientId, reaction.type, reaction.timestamp]
         );
-    });
+        const newId = result.rows[0].id;
+        console.log(`Reaction '${reaction.type}' added for article ${articleId} by client ${reaction.clientId}`);
+        return { id: newId, ...reaction };
+    } catch (err) {
+        console.error("Error inserting reaction (PostgreSQL):", err.message);
+        throw err;
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
 }
-
 
 /**
  * Sends a message to all connected WebSocket clients.
@@ -236,16 +233,16 @@ function broadcast(message) {
     });
 }
 
-// WebSocket connection handling
+// WebSocket connection handling (this part remains largely the same)
 wss.on('connection', async (ws) => {
     console.log('Client connected.');
 
     // Send all existing articles to the newly connected client
     try {
         const articles = await getAllArticles();
-        console.log(`Server: Found ${articles.length} articles to send on new connection.`); // Added logging
+        console.log(`Server: Found ${articles.length} articles to send on new connection.`);
         ws.send(JSON.stringify({ type: 'ALL_ARTICLES', articles: articles }));
-        console.log('Server: Sent ALL_ARTICLES to new client.'); // Added logging
+        console.log('Server: Sent ALL_ARTICLES to new client.');
     } catch (error) {
         console.error('Error sending initial articles:', error);
         ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to load articles.' }));
@@ -258,41 +255,37 @@ wss.on('connection', async (ws) => {
 
             switch (data.type) {
                 case 'PUBLISH_ARTICLE':
-                    console.log('Server: Processing PUBLISH_ARTICLE request...'); // Added logging
+                    console.log('Server: Processing PUBLISH_ARTICLE request...');
                     const newArticle = await addArticle(data.article);
-                    // Broadcast the newly published article (with its ID from DB) to all clients
                     broadcast({ type: 'NEW_ARTICLE', article: newArticle });
-                    console.log('Server: Broadcasted NEW_ARTICLE.'); // Added logging
+                    console.log('Server: Broadcasted NEW_ARTICLE.');
                     break;
                 case 'POST_COMMENT':
-                    console.log('Server: Processing POST_COMMENT request...'); // Added logging
+                    console.log('Server: Processing POST_COMMENT request...');
                     const { articleId: commentArticleId, comment } = data;
                     const addedComment = await addComment(commentArticleId, comment);
-                    // Broadcast the new comment to all clients
                     broadcast({ type: 'NEW_COMMENT', articleId: commentArticleId, comment: addedComment });
-                    console.log('Server: Broadcasted NEW_COMMENT.'); // Added logging
+                    console.log('Server: Broadcasted NEW_COMMENT.');
                     break;
                 case 'POST_REACTION':
-                    console.log('Server: Processing POST_REACTION request...'); // Added logging
+                    console.log('Server: Processing POST_REACTION request...');
                     const { articleId: reactionArticleId, reaction } = data;
                     const addedReaction = await addReaction(reactionArticleId, reaction);
-                    // Broadcast the new reaction to all clients
                     broadcast({ type: 'NEW_REACTION', articleId: reactionArticleId, reaction: addedReaction });
-                    console.log('Server: Broadcasted NEW_REACTION.'); // Added logging
+                    console.log('Server: Broadcasted NEW_REACTION.');
                     break;
-                case 'GET_ALL_ARTICLES': // This case is primarily for initial connection, but kept for clarity
-                    console.log('Server: Processing GET_ALL_ARTICLES request (on message)...'); // Added logging
+                case 'GET_ALL_ARTICLES':
+                    console.log('Server: Processing GET_ALL_ARTICLES request (on message)...');
                     const articles = await getAllArticles();
-                    console.log(`Server: Found ${articles.length} articles to send for GET_ALL_ARTICLES message.`); // Added logging
+                    console.log(`Server: Found ${articles.length} articles to send for GET_ALL_ARTICLES message.`);
                     ws.send(JSON.stringify({ type: 'ALL_ARTICLES', articles: articles }));
-                    console.log('Server: Sent ALL_ARTICLES in response to GET_ALL_ARTICLES message.'); // Added logging
+                    console.log('Server: Sent ALL_ARTICLES in response to GET_ALL_ARTICLES message.');
                     break;
                 default:
                     console.warn('Unknown message type:', data.type);
             }
         } catch (error) {
             console.error('Error processing message:', error);
-            // Send a more detailed error message if possible (avoid exposing sensitive details)
             ws.send(JSON.stringify({ type: 'ERROR', message: `Server error: ${error.message || 'Unknown error.'}` }));
         }
     });
