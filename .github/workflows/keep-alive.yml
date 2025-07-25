@@ -1,0 +1,21 @@
+name: Keep NewsApp Render Server Awake
+
+on:
+  schedule:
+    # This cron job will run every 10 minutes.
+    # GitHub Actions schedules are in UTC.
+    - cron: '*/10 * * * *'
+
+jobs:
+  ping-newsapp-server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping NewsApp Server
+        run: |
+          # Use curl to send an HTTP GET request to your Render server.
+          # -s: Silent mode (don't show progress meter)
+          # -S: Show error message if curl fails
+          # || true: Ensures the step succeeds even if the curl command fails
+          #          (e.g., if your server is temporarily down), preventing
+          #          unnecessary GitHub Action failure notifications.
+          curl -sS https://newsapp-z14a.onrender.com || true
