@@ -1,7 +1,7 @@
 // server.js
 const WebSocket = require('ws');
-const { Pool } = require('pg'); // Import Pool from pg library
-const path = require('path'); // Still needed if you use path elsewhere, but not for DB_PATH anymore
+const { Pool } = require('pg');
+const path = require('path');
 
 // WebSocket server setup
 const PORT = process.env.PORT || 3000;
@@ -9,11 +9,10 @@ const wss = new WebSocket.Server({ port: PORT });
 console.log(`WebSocket server started on ws://localhost:${PORT}`);
 
 // --- PostgreSQL Database setup ---
-// Use environment variable for database connection string
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: {
-        rejectUnauthorized: false // Required for Render's managed PostgreSQL to connect from Node.js
+        rejectUnauthorized: false
     }
 });
 
@@ -21,33 +20,49 @@ const pool = new Pool({
 async function connectAndInitDb() {
     let client;
     try {
-        client = await pool.connect(); // Get a client from the pool
+        client = await pool.connect();
         console.log('Connected to PostgreSQL database.');
 
-        // 1. Create articles table
+        // 1. Create categories table
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS categories (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE
+            );
+        `);
+        console.log('Categories table ensured.');
+
+        // Insert default categories if none exist (optional, but good for starting)
+        const categoriesCountResult = await client.query("SELECT COUNT(*) AS count FROM categories;");
+        if (parseInt(categoriesCountResult.rows[0].count) === 0) {
+            console.log("No categories found, inserting default categories...");
+            await client.query(`
+                INSERT INTO categories (name) VALUES
+                ('General'), ('Technology'), ('Sports'), ('Politics'), ('Entertainment')
+                ON CONFLICT (name) DO NOTHING;
+            `);
+            console.log("Default categories inserted.");
+        }
+
+
+        // 2. Create articles table (modified to include category_id)
         await client.query(`
             CREATE TABLE IF NOT EXISTS articles (
                 id SERIAL PRIMARY KEY,
                 title TEXT NOT NULL,
                 content TEXT NOT NULL,
                 imageUrl TEXT,
-                timestamp BIGINT NOT NULL
+                timestamp BIGINT NOT NULL,
+                category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL -- Link to categories
             );
         `);
         console.log('Articles table ensured.');
 
-        // Add a test article if the table is empty
-        const countResult = await client.query("SELECT COUNT(*) AS count FROM articles;");
-        if (parseInt(countResult.rows[0].count) === 0) {
-            console.log("No articles found, inserting a sample article...");
-            await client.query(
-                "INSERT INTO articles (title, content, imageUrl, timestamp) VALUES ($1, $2, $3, $4)",
-                ["Welcome to the News Hub!", "This is a sample article to show that the system is working persistently!", "", Date.now()]
-            );
-            console.log("Sample article inserted with ID.");
-        }
+        // --- REMOVED TEST ARTICLE INSERTION LOGIC ---
+        // The previous block for inserting a sample article if the table was empty has been removed.
+        // If you need a sample article, you'll publish it through your client now.
 
-        // 2. Create comments table
+        // 3. Create comments table
         await client.query(`
             CREATE TABLE IF NOT EXISTS comments (
                 id SERIAL PRIMARY KEY,
@@ -59,7 +74,7 @@ async function connectAndInitDb() {
         `);
         console.log('Comments table ensured.');
 
-        // 3. Create reactions table
+        // 4. Create reactions table
         await client.query(`
             CREATE TABLE IF NOT EXISTS reactions (
                 id SERIAL PRIMARY KEY,
@@ -73,28 +88,51 @@ async function connectAndInitDb() {
 
     } catch (err) {
         console.error('Error connecting or initializing PostgreSQL:', err.message);
-        // Exit process if database connection fails at startup, as app won't function
         process.exit(1);
     } finally {
         if (client) {
-            client.release(); // Release the client back to the pool
+            client.release();
         }
     }
 }
 
-connectAndInitDb(); // Call the async function to connect and initialize on startup
+connectAndInitDb();
+
+// --- New function to get all categories ---
+async function getAllCategories() {
+    const client = await pool.connect();
+    try {
+        const result = await client.query("SELECT id, name FROM categories ORDER BY name ASC;");
+        return result.rows;
+    } catch (err) {
+        console.error("Error fetching categories:", err.message);
+        throw err;
+    } finally {
+        if (client) {
+            client.release();
+        }
+    }
+}
+
 
 // --- Database interaction functions (using pg.Pool) ---
 
 /**
- * Fetches all articles along with their comments and reactions.
+ * Fetches all articles along with their comments, reactions, and category.
  * @returns {Promise<Array>} A promise that resolves to an array of article objects.
  */
 async function getAllArticles() {
     const client = await pool.connect();
     try {
-        // Fetch all articles
-        const articlesResult = await client.query("SELECT * FROM articles ORDER BY timestamp DESC;");
+        // Fetch all articles, joining with categories to get the category name
+        const articlesResult = await client.query(`
+            SELECT
+                a.id, a.title, a.content, a.imageUrl, a.timestamp,
+                c.id AS category_id, c.name AS category_name
+            FROM articles a
+            LEFT JOIN categories c ON a.category_id = c.id
+            ORDER BY a.timestamp DESC;
+        `);
         const articles = articlesResult.rows;
 
         if (!articles || articles.length === 0) {
@@ -124,6 +162,7 @@ async function getAllArticles() {
                 content: article.content,
                 imageUrl: article.imageUrl,
                 timestamp: article.timestamp,
+                category: article.category_name ? { id: article.category_id, name: article.category_name } : null, // Include category object
                 comments: comments,
                 reactions: reactions
             });
@@ -131,7 +170,7 @@ async function getAllArticles() {
         return articlesWithDetails;
     } catch (err) {
         console.error("Error in getAllArticles (PostgreSQL):", err.message);
-        throw err; // Re-throw to be caught by the calling WebSocket handler
+        throw err;
     } finally {
         if (client) {
             client.release();
@@ -142,18 +181,28 @@ async function getAllArticles() {
 /**
  * Adds a new article to the database.
  * @param {object} article - The article data.
- * @returns {Promise<object>} A promise that resolves to the inserted article with its ID.
+ * @param {number} [article.categoryId] - Optional: The ID of the category this article belongs to.
+ * @returns {Promise<object>} A promise that resolves to the inserted article with its ID and category details.
  */
 async function addArticle(article) {
     const client = await pool.connect();
     try {
         const result = await client.query(
-            "INSERT INTO articles (title, content, imageUrl, timestamp) VALUES ($1, $2, $3, $4) RETURNING id;",
-            [article.title, article.content, article.imageUrl, article.timestamp]
+            "INSERT INTO articles (title, content, imageUrl, timestamp, category_id) VALUES ($1, $2, $3, $4, $5) RETURNING id;",
+            [article.title, article.content, article.imageUrl, article.timestamp, article.categoryId || null] // categoryId can be null
         );
         const newId = result.rows[0].id;
+
+        let categoryDetails = null;
+        if (article.categoryId) {
+            const categoryResult = await client.query("SELECT id, name FROM categories WHERE id = $1;", [article.categoryId]);
+            if (categoryResult.rows.length > 0) {
+                categoryDetails = categoryResult.rows[0];
+            }
+        }
+
         console.log(`Article "${article.title}" inserted with ID: ${newId}`);
-        return { id: newId, ...article };
+        return { id: newId, ...article, category: categoryDetails }; // Return category details with the new article
     } catch (err) {
         console.error("Error inserting article (PostgreSQL):", err.message);
         throw err;
@@ -225,7 +274,6 @@ function broadcast(message) {
         if (client.readyState === WebSocket.OPEN) {
             try {
                 client.send(JSON.stringify(message));
-                // console.log('Broadcasted message:', message.type); // Optional: verbose logging
             } catch (error) {
                 console.error('Error broadcasting message:', error);
             }
@@ -233,19 +281,24 @@ function broadcast(message) {
     });
 }
 
-// WebSocket connection handling (this part remains largely the same)
+// WebSocket connection handling
 wss.on('connection', async (ws) => {
     console.log('Client connected.');
 
-    // Send all existing articles to the newly connected client
+    // Send all existing articles AND categories to the newly connected client
     try {
         const articles = await getAllArticles();
-        console.log(`Server: Found ${articles.length} articles to send on new connection.`);
-        ws.send(JSON.stringify({ type: 'ALL_ARTICLES', articles: articles }));
-        console.log('Server: Sent ALL_ARTICLES to new client.');
+        const categories = await getAllCategories(); // Fetch categories
+        console.log(`Server: Found ${articles.length} articles and ${categories.length} categories to send on new connection.`);
+        ws.send(JSON.stringify({
+            type: 'INITIAL_DATA', // New type to send both
+            articles: articles,
+            categories: categories
+        }));
+        console.log('Server: Sent INITIAL_DATA to new client.');
     } catch (error) {
-        console.error('Error sending initial articles:', error);
-        ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to load articles.' }));
+        console.error('Error sending initial data:', error);
+        ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to load initial data.' }));
     }
 
     ws.on('message', async (message) => {
@@ -256,6 +309,7 @@ wss.on('connection', async (ws) => {
             switch (data.type) {
                 case 'PUBLISH_ARTICLE':
                     console.log('Server: Processing PUBLISH_ARTICLE request...');
+                    // The client needs to send categoryId in data.article
                     const newArticle = await addArticle(data.article);
                     broadcast({ type: 'NEW_ARTICLE', article: newArticle });
                     console.log('Server: Broadcasted NEW_ARTICLE.');
@@ -274,12 +328,19 @@ wss.on('connection', async (ws) => {
                     broadcast({ type: 'NEW_REACTION', articleId: reactionArticleId, reaction: addedReaction });
                     console.log('Server: Broadcasted NEW_REACTION.');
                     break;
-                case 'GET_ALL_ARTICLES':
+                case 'GET_ALL_ARTICLES': // Client can still request all articles
                     console.log('Server: Processing GET_ALL_ARTICLES request (on message)...');
                     const articles = await getAllArticles();
                     console.log(`Server: Found ${articles.length} articles to send for GET_ALL_ARTICLES message.`);
                     ws.send(JSON.stringify({ type: 'ALL_ARTICLES', articles: articles }));
                     console.log('Server: Sent ALL_ARTICLES in response to GET_ALL_ARTICLES message.');
+                    break;
+                case 'GET_ALL_CATEGORIES': // New message type for fetching categories
+                    console.log('Server: Processing GET_ALL_CATEGORIES request...');
+                    const categories = await getAllCategories();
+                    console.log(`Server: Found ${categories.length} categories to send.`);
+                    ws.send(JSON.stringify({ type: 'ALL_CATEGORIES', categories: categories }));
+                    console.log('Server: Sent ALL_CATEGORIES.');
                     break;
                 default:
                     console.warn('Unknown message type:', data.type);
