@@ -12,6 +12,6 @@
   "description": "",
   "dependencies": {
     "ws": "^8.18.3",
-    "pg": "^8.12.0"  <-- ADDED THIS LINE AND REMOVED sqlite3
+    "pg": "^8.12.0"
   }
 }
