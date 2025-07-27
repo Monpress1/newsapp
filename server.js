@@ -1,93 +1,93 @@
+// server.js
+
 const WebSocket = require('ws');
 const http = require('http');
-const { Client } = require('pg'); // PostgreSQL client
-require('dotenv').config(); // For loading environment variables (like DB URL for local dev)
+const sqlite3 = require('sqlite3').verbose(); // Import sqlite3 and enable verbose mode
+const util = require('util'); // Node.js utility module for promisify
 
-// --- PostgreSQL Connection ---
-// Render will automatically set process.env.DATABASE_URL
-// For local development, ensure you have a .env file with DATABASE_URL
-const DATABASE_URL = process.env.DATABASE_URL;
-
-if (!DATABASE_URL) {
-    console.error('DATABASE_URL environment variable is not set. Please set it for local development or in Render environment.');
-    process.exit(1); // Exit if no database URL
-}
-
-const pgClient = new Client({
-    connectionString: DATABASE_URL,
-    ssl: {
-        // Required for Render's managed PostgreSQL to work, especially if connecting from local
-        // or between Render services without specific CA certs.
-        rejectUnauthorized: false
+// --- SQLite Database Connection ---
+// The database file will be created if it doesn't exist
+const DB_PATH = './news.db';
+const db = new sqlite3.Database(DB_PATH, (err) => {
+    if (err) {
+        console.error('Error connecting to SQLite database:', err.message);
+        process.exit(1); // Exit if database connection fails
+    } else {
+        console.log('Connected to the SQLite database.');
     }
 });
 
+// Promisify SQLite methods for async/await usage
+db.run = util.promisify(db.run);
+db.get = util.promisify(db.get);
+db.all = util.promisify(db.all);
+
 async function connectDb() {
     try {
-        await pgClient.connect();
-        console.log('Connected to PostgreSQL database');
+        // We already connected to the database in the initialization above.
+        // This function will now primarily ensure tables exist and categories are initialized.
         await createTables(); // Ensure tables exist on connect
         await initializeCategories(); // Ensure default categories exist
     } catch (err) {
-        console.error('Error connecting to PostgreSQL:', err.message);
-        // In a production app, you might want more sophisticated reconnection logic
-        process.exit(1); // Exit if database connection fails
+        console.error('Error setting up SQLite database:', err.message);
+        process.exit(1); // Exit if setup fails
     }
 }
 
 // --- Database Schema Setup ---
 async function createTables() {
+    // SQLite uses INTEGER PRIMARY KEY AUTOINCREMENT for auto-incrementing IDs
+    // TEXT is generally used for strings, INTEGER for numbers (including timestamps)
+    // FOREIGN KEY constraints are supported.
+
     const createCategoriesTable = `
         CREATE TABLE IF NOT EXISTS categories (
-            id SERIAL PRIMARY KEY,
-            name VARCHAR(255) UNIQUE NOT NULL
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL
         );
     `;
 
-    // Articles table
     const createArticlesTable = `
         CREATE TABLE IF NOT EXISTS articles (
-            id SERIAL PRIMARY KEY,
-            title VARCHAR(255) NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
             content TEXT NOT NULL,
             image_url TEXT,
-            timestamp BIGINT NOT NULL,
-            category_id INT,
+            timestamp INTEGER NOT NULL, -- Storing timestamp as INTEGER (milliseconds since epoch)
+            category_id INTEGER,
             FOREIGN KEY (category_id) REFERENCES categories (id) ON DELETE SET NULL
         );
     `;
 
-    // Comments table
     const createCommentsTable = `
         CREATE TABLE IF NOT EXISTS comments (
-            id SERIAL PRIMARY KEY,
-            article_id INT NOT NULL,
-            user_name VARCHAR(255),
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            article_id INTEGER NOT NULL,
+            user_name TEXT,
             comment_text TEXT NOT NULL,
-            timestamp BIGINT NOT NULL,
+            timestamp INTEGER NOT NULL,
             FOREIGN KEY (article_id) REFERENCES articles (id) ON DELETE CASCADE
         );
     `;
 
-    // Reactions table
     const createReactionsTable = `
         CREATE TABLE IF NOT EXISTS reactions (
-            id SERIAL PRIMARY KEY,
-            article_id INT NOT NULL,
-            type VARCHAR(50) NOT NULL,
-            client_id VARCHAR(255) NOT NULL,
-            timestamp BIGINT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            article_id INTEGER NOT NULL,
+            type TEXT NOT NULL, -- e.g., 'like', 'heart'
+            client_id TEXT NOT NULL, -- Unique identifier for the client/user
+            timestamp INTEGER NOT NULL,
             UNIQUE(article_id, client_id, type), -- Prevents same user/same type multiple reactions
             FOREIGN KEY (article_id) REFERENCES articles (id) ON DELETE CASCADE
         );
     `;
 
     try {
-        await pgClient.query(createCategoriesTable);
-        await pgClient.query(createArticlesTable);
-        await pgClient.query(createCommentsTable);
-        await pgClient.query(createReactionsTable);
-        console.log('Database tables ensured (created if not exist).');
+        await db.run(createCategoriesTable);
+        await db.run(createArticlesTable);
+        await db.run(createCommentsTable);
+        await db.run(createReactionsTable);
+        console.log('SQLite database tables ensured (created if not exist).');
     } catch (err) {
         console.error('Error creating tables:', err.message);
         throw err; // Re-throw to stop server if tables can't be created
@@ -108,11 +108,9 @@ async function initializeCategories() {
 
     try {
         for (const cat of defaultCategories) {
-            // UPSERT logic: Insert if not exists, do nothing if it does
-            await pgClient.query(
-                `INSERT INTO categories (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`,
-                [cat.name]
-            );
+            // SQLite UPSERT logic: INSERT OR IGNORE
+            // If a row with the same unique 'name' already exists, the insert is ignored.
+            await db.run(`INSERT OR IGNORE INTO categories (name) VALUES (?)`, [cat.name]);
         }
         console.log('Default categories initialized/ensured.');
     } catch (err) {
@@ -142,9 +140,8 @@ wss.on('connection', async ws => {
     console.log('Client connected');
 
     try {
-        // Fetch all articles from PostgreSQL, including nested comments and reactions
-        // and join with category name.
-        const result = await pgClient.query(`
+        // Fetch all articles
+        const articlesRows = await db.all(`
             SELECT
                 a.id,
                 a.title,
@@ -152,18 +149,44 @@ wss.on('connection', async ws => {
                 a.image_url,
                 a.timestamp,
                 a.category_id,
-                c.name AS category_name,
-                (SELECT JSON_AGG(json_build_object('id', co.id, 'userName', co.user_name, 'commentText', co.comment_text, 'timestamp', co.timestamp))
-                 FROM comments co WHERE co.article_id = a.id) AS comments,
-                (SELECT JSON_AGG(json_build_object('id', r.id, 'type', r.type, 'clientId', r.client_id, 'timestamp', r.timestamp))
-                 FROM reactions r WHERE r.article_id = a.id) AS reactions
+                c.name AS category_name
             FROM articles a
             LEFT JOIN categories c ON a.category_id = c.id
             ORDER BY a.timestamp DESC;
         `);
 
-        // Transform data to match client's expected JavaScript object structure
-        const articles = result.rows.map(row => ({
+        // Fetch all comments and group them by article_id
+        const commentsRows = await db.all(`SELECT id, article_id, user_name, comment_text, timestamp FROM comments`);
+        const commentsByArticle = commentsRows.reduce((acc, comment) => {
+            if (!acc[comment.article_id]) {
+                acc[comment.article_id] = [];
+            }
+            acc[comment.article_id].push({
+                id: comment.id,
+                userName: comment.user_name,
+                commentText: comment.comment_text,
+                timestamp: comment.timestamp
+            });
+            return acc;
+        }, {});
+
+        // Fetch all reactions and group them by article_id
+        const reactionsRows = await db.all(`SELECT id, article_id, type, client_id, timestamp FROM reactions`);
+        const reactionsByArticle = reactionsRows.reduce((acc, reaction) => {
+            if (!acc[reaction.article_id]) {
+                acc[reaction.article_id] = [];
+            }
+            acc[reaction.article_id].push({
+                id: reaction.id,
+                type: reaction.type,
+                clientId: reaction.client_id,
+                timestamp: reaction.timestamp
+            });
+            return acc;
+        }, {});
+
+        // Combine articles with their comments and reactions
+        const articles = articlesRows.map(row => ({
             id: row.id,
             title: row.title,
             content: row.content,
@@ -171,13 +194,12 @@ wss.on('connection', async ws => {
             timestamp: parseInt(row.timestamp), // Ensure timestamp is a number
             categoryId: row.category_id,
             category: row.category_id ? { id: row.category_id, name: row.category_name } : null,
-            comments: row.comments || [], // Ensure it's an empty array if no comments
-            reactions: row.reactions || [] // Ensure it's an empty array if no reactions
+            comments: commentsByArticle[row.id] || [], // Attach comments, default to empty array
+            reactions: reactionsByArticle[row.id] || [] // Attach reactions, default to empty array
         }));
 
         // Fetch all categories for the client's dropdown
-        const categoriesResult = await pgClient.query('SELECT id, name FROM categories ORDER BY name');
-        const categories = categoriesResult.rows;
+        const categories = await db.all('SELECT id, name FROM categories ORDER BY name');
 
         // Send initial data to the newly connected client
         ws.send(JSON.stringify({
@@ -203,21 +225,26 @@ wss.on('connection', async ws => {
                     const timestamp = Date.now(); // Server sets the timestamp
 
                     // Insert the new article into the database
-                    const insertArticleResult = await pgClient.query(
+                    const insertArticleResult = await db.run(
                         `INSERT INTO articles (title, content, image_url, timestamp, category_id)
-                         VALUES ($1, $2, $3, $4, $5) RETURNING *`, // RETURNING * gets the inserted row
+                         VALUES (?, ?, ?, ?, ?)`,
                         [title, content, imageUrl, timestamp, categoryId]
                     );
-                    const newArticleRow = insertArticleResult.rows[0]; // The newly inserted article row
+                    const newArticleId = insertArticleResult.lastID; // Get the ID of the newly inserted row
 
-                    // Fetch category name for the article to send back to client
-                    let categoryName = null;
-                    if (newArticleRow.category_id) {
-                        const categoryResult = await pgClient.query('SELECT name FROM categories WHERE id = $1', [newArticleRow.category_id]);
-                        if (categoryResult.rows.length > 0) {
-                            categoryName = categoryResult.rows[0].name;
-                        }
-                    }
+                    // Fetch the newly inserted article to get all its fields, including the generated ID
+                    const newArticleRow = await db.get(`
+                        SELECT
+                            a.id,
+                            a.title,
+                            a.content,
+                            a.image_url,
+                            a.timestamp,
+                            a.category_id,
+                            c.name AS category_name
+                        FROM articles a
+                        LEFT JOIN categories c ON a.category_id = c.id
+                        WHERE a.id = ?`, [newArticleId]);
 
                     // Format the new article data for broadcasting to clients
                     const newArticle = {
@@ -227,7 +254,7 @@ wss.on('connection', async ws => {
                         imageUrl: newArticleRow.image_url,
                         timestamp: parseInt(newArticleRow.timestamp), // Ensure timestamp is a number
                         categoryId: newArticleRow.category_id,
-                        category: newArticleRow.category_id ? { id: newArticleRow.category_id, name: categoryName } : null,
+                        category: newArticleRow.category_id ? { id: newArticleRow.category_id, name: newArticleRow.category_name } : null,
                         comments: [], // Newly published article has no comments initially
                         reactions: [] // Newly published article has no reactions initially
                     };
@@ -246,19 +273,19 @@ wss.on('connection', async ws => {
                     const commentTimestamp = Date.now(); // Server sets the timestamp
 
                     // Insert the new comment into the database
-                    const insertCommentResult = await pgClient.query(
+                    const insertCommentResult = await db.run(
                         `INSERT INTO comments (article_id, user_name, comment_text, timestamp)
-                         VALUES ($1, $2, $3, $4) RETURNING *`,
+                         VALUES (?, ?, ?, ?)`,
                         [articleIdForComment, userName || 'Anonymous', commentText, commentTimestamp]
                     );
-                    const newCommentRow = insertCommentResult.rows[0]; // The newly inserted comment row
+                    const newCommentId = insertCommentResult.lastID;
 
                     // Format the new comment data for broadcasting to clients
                     const newComment = {
-                        id: newCommentRow.id,
-                        userName: newCommentRow.user_name,
-                        commentText: newCommentRow.comment_text,
-                        timestamp: parseInt(newCommentRow.timestamp) // Ensure timestamp is a number
+                        id: newCommentId,
+                        userName: userName || 'Anonymous',
+                        commentText: commentText,
+                        timestamp: parseInt(commentTimestamp) // Ensure timestamp is a number
                     };
 
                     // Broadcast the new comment to all connected clients
@@ -271,46 +298,45 @@ wss.on('connection', async ws => {
 
                 case 'POST_REACTION':
                     const articleIdForReaction = data.articleId;
-                    // Renamed 'type' to 'reactionType' to avoid conflict with the message 'type'
                     const { type: reactionType, clientId } = data.reaction;
                     const reactionTimestamp = Date.now(); // Server sets the timestamp
 
                     try {
                         // Attempt to insert the reaction.
-                        // The UNIQUE constraint on (article_id, client_id, type) in the DB
-                        // will automatically prevent duplicate reactions from the same user for the same type.
-                        const insertReactionResult = await pgClient.query(
-                            `INSERT INTO reactions (article_id, type, client_id, timestamp)
-                             VALUES ($1, $2, $3, $4) RETURNING *`,
+                        // SQLite's INSERT OR IGNORE will prevent duplicates based on the UNIQUE constraint.
+                        const insertReactionResult = await db.run(
+                            `INSERT OR IGNORE INTO reactions (article_id, type, client_id, timestamp)
+                             VALUES (?, ?, ?, ?)`,
                             [articleIdForReaction, reactionType, clientId, reactionTimestamp]
                         );
-                        const newReactionRow = insertReactionResult.rows[0]; // The newly inserted reaction row
 
-                        // Format the new reaction data for broadcasting to clients
-                        const newReaction = {
-                            id: newReactionRow.id,
-                            type: newReactionRow.type,
-                            clientId: newReactionRow.client_id,
-                            timestamp: parseInt(newReactionRow.timestamp) // Ensure timestamp is a number
-                        };
+                        if (insertReactionResult.changes > 0) {
+                            // If changes > 0, the insert was successful
+                            const newReactionId = insertReactionResult.lastID;
 
-                        // Broadcast the new reaction to all connected clients
-                        wss.clients.forEach(client => {
-                            if (client.readyState === WebSocket.OPEN) {
-                                client.send(JSON.stringify({ type: 'NEW_REACTION', articleId: articleIdForReaction, reaction: newReaction }));
-                            }
-                        });
-                    } catch (error) {
-                        // Check for unique constraint violation (PostgreSQL error code '23505')
-                        if (error.code === '23505') {
-                            // This means the user already reacted with this type on this article
+                            // Format the new reaction data for broadcasting to clients
+                            const newReaction = {
+                                id: newReactionId,
+                                type: reactionType,
+                                clientId: clientId,
+                                timestamp: parseInt(reactionTimestamp) // Ensure timestamp is a number
+                            };
+
+                            // Broadcast the new reaction to all connected clients
+                            wss.clients.forEach(client => {
+                                if (client.readyState === WebSocket.OPEN) {
+                                    client.send(JSON.stringify({ type: 'NEW_REACTION', articleId: articleIdForReaction, reaction: newReaction }));
+                                }
+                            });
+                        } else {
+                            // If changes is 0, it means the INSERT OR IGNORE was ignored due to a unique constraint violation
                             ws.send(JSON.stringify({ type: 'ERROR', message: 'You have already reacted with this type.' }));
                             console.log(`Client ${clientId} tried to add duplicate reaction '${reactionType}' to article ${articleIdForReaction}.`);
-                        } else {
-                            // Other database errors
-                            console.error('Error posting reaction to DB:', error.message);
-                            ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to post reaction due to server error.' }));
                         }
+                    } catch (error) {
+                        // Catch other potential database errors (though INSERT OR IGNORE handles the common one)
+                        console.error('Error posting reaction to DB:', error.message);
+                        ws.send(JSON.stringify({ type: 'ERROR', message: 'Failed to post reaction due to server error.' }));
                     }
                     break;
 
@@ -344,4 +370,15 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`Server listening on http://localhost:${PORT}`);
     console.log(`WebSocket server running on ws://localhost:${PORT}`);
+});
+
+// Gracefully close the database connection when the app exits
+process.on('SIGINT', () => {
+    db.close((err) => {
+        if (err) {
+            console.error('Error closing database:', err.message);
+        }
+        console.log('SQLite database connection closed.');
+        process.exit(0);
+    });
 });
